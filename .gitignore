@@ -1,0 +1,13 @@
+# 忽略挂载的数据目录（包含你的 Cookie 和截图）
+
+
+# 忽略 Python 缓存文件
+__pycache__/
+*.pyc
+
+# 忽略可能包含环境变量的文件
+.env
+
+# 忽略其他
+.devicecode_*
+ctyun_*.json

@@ -1,0 +1,435 @@
+"""
+天翼云电脑
+"""
+
+import atexit
+import datetime
+import json
+import os
+import random
+import sys
+import threading
+import time
+from typing import Optional, Union
+
+import ddddocr
+from DrissionPage import ChromiumOptions, ChromiumPage
+
+from task_lock import SingleInstanceLock
+
+for stream in (sys.stdout, sys.stderr):
+    reconfigure = getattr(stream, "reconfigure", None)
+    if callable(reconfigure):
+        reconfigure(encoding="utf-8")
+
+PRESET_MESSAGES = [
+    "今天北京天气怎么样？（简短回答）",
+    "给我讲一个冷笑话。（简短回答）",
+    "来一首古诗。（简短回答）",
+    "空腹可以吃饭吗？（简短回答）",
+    "推荐一部人生必看电影。（简短回答）",
+]
+
+
+# ==========================================
+# Cookie 持久化辅助函数
+# ==========================================
+def save_cookies(page: ChromiumPage, file_path: str) -> None:
+    """获取当前页面的 Cookie 并持久化保存到本地文件。"""
+    try:
+        # 确保目录存在
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        cookies = page.cookies()
+        if not cookies:
+            print(f"[-] 抓取到的 Cookie 为空，已取消保存操作: {file_path}")
+            return
+        # 原因：确保获取到的 Cookie 具备业务层面的真实登录凭证，避免保存无用的访客 Cookie
+        has_yl_token = False
+
+        if isinstance(cookies, list):
+            has_yl_token = any(cookie.get("name") == "YL-Token" for cookie in cookies)
+        elif isinstance(cookies, dict):
+            has_yl_token = "YL-Token" in cookies
+        if not has_yl_token:
+            print(f"[-] Cookie 中缺失关键凭证 'YL-Token'，已取消保存操作: {file_path}")
+            return
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(cookies, f, ensure_ascii=False, indent=4)
+        os.chmod(file_path, 0o600)
+        print(f"[*] Cookie 已成功保存至: {file_path}")
+
+    except Exception as e:
+        print(f"[!] 保存 Cookie 失败: {e}")
+
+
+def load_cookies(page: ChromiumPage, file_path: str) -> bool:
+    """从本地文件读取 Cookie 并加载到浏览器中。"""
+    if not os.path.exists(file_path):
+        print(f"[-] 未发现本地 Cookie 缓存文件: {file_path}")
+        return False
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            cookies = json.load(f)
+        page.set.cookies(cookies)
+        print(f"[*] 本地 Cookie 加载完成: {file_path}")
+        return True
+    except Exception as e:
+        print(f"[!] 加载 Cookie 失败: {e}")
+        return False
+
+
+# ==========================================
+# 浏览器初始化与核心功能函数
+# ==========================================
+
+
+def init_browser_options() -> ChromiumOptions:
+    """初始化并配置 Chromium 浏览器的启动参数。"""
+    options = ChromiumOptions()
+    options.set_argument("--no-sandbox")
+    options.set_argument("--disable-gpu")
+    options.set_argument("--disable-dev-shm-usage")
+    options.headless()
+    return options
+
+
+def stop_listener_if_running(page: ChromiumPage) -> None:
+    """兼容旧版 DrissionPage：未启动监听时不能直接调用 stop()。"""
+    listener = page.listen
+    if getattr(listener, "listening", False):
+        listener.stop()
+
+
+def fill_credentials(page: ChromiumPage, username: str, password: str) -> None:
+    """在页面上填写账号与密码信息。"""
+    print("正在输入账号信息...")
+    account_input = page.ele('css:input[type="text"]')
+    account_input.clear()
+    account_input.input(username)
+
+    print("正在输入密码信息...")
+    password_input = page.ele('css:input[type="password"]')
+    password_input.clear()
+    password_input.input(password)
+
+
+def handle_captcha(page: ChromiumPage) -> None:
+    """检测页面是否存在图形验证码容器，若存在则提取图片并填充识别结果。"""
+    print("正在检测图形验证码容器...")
+    captcha_container = page.ele("css:.fgt-capt-ct", timeout=2)
+
+    if not captcha_container:
+        print("当前无需处理图形验证码。")
+        return
+
+    print("检测到图形验证码，开始提取并识别...")
+    pic_ele = captcha_container.ele("css:img")
+    pic_bytes = pic_ele.get_screenshot(as_bytes=True)
+
+    ocr_result = get_bytes_numeric_captcha(pic_bytes)
+    print(f"OCR 识别结果为: {ocr_result}")
+
+    input_ele = captcha_container.ele('css:input[placeholder="输入图形验证码"]')
+    input_ele.clear()
+    input_ele.input(ocr_result)
+
+
+def analyze_login_response(response_body: Union[dict, str, None]) -> int:
+    """分析登录接口的返回体，提取并映射为内部状态码。"""
+    # 登录成功时接口可能通过空响应体配合重定向完成，
+    # 最终是否成功由调用方再校验聊天页面的核心元素。
+    if not response_body:
+        return 0
+    if not isinstance(response_body, dict):
+        return -1
+
+    code = response_body.get("code")
+    msg = response_body.get("msg", "")
+
+    if code in (0, 200):
+        return 0
+    if code == 51040 and "用户名或密码错误" in msg:
+        return 1
+    elif code == 51030:
+        return 2
+    elif code == 51040 and "图形验证码" in msg:
+        return 3
+    return -1
+
+
+def save_screenshot(page: ChromiumPage) -> None:
+    file_name = f"{os.getenv('APP_USER')}_{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    if os.getenv("RUNNING_IN_DOCKER") == "true":
+        path = "/app/data"
+    else:
+        path = "./"
+    page.get_screenshot(path=path, name=file_name, full_page=True)
+
+
+def execute_login_with_listener(
+    page: ChromiumPage,
+    target_url: str,
+    username: str,
+    password: str,
+) -> Optional[bool]:
+    """执行完整的账号密码登录流程。"""
+    print("\n--- 开始账密登录流程 ---")
+    print(f"访问登录页面: {target_url}")
+    page.get(target_url)
+    page.wait.load_start()
+
+    fill_credentials(page, username, password)
+
+    handle_captcha(page)
+
+    if not page.wait.ele_displayed("css:button.lgm-submit-ct", timeout=5):
+        raise RuntimeError("页面未渲染出登录按钮")
+
+    # 确认显示后，重新提取元素对象
+    login_button = page.ele("css:button.lgm-submit-ct")
+
+    stop_listener_if_running(page)
+    page.listen.start("api/auth/iam/login")
+    try:
+        if not login_button.click():
+            raise RuntimeError("登录按钮点击失败")
+
+        print("已点击登录，等待接口返回...")
+        packet = page.listen.wait(timeout=15)
+    finally:
+        stop_listener_if_running(page)
+
+    if not packet:
+        raise RuntimeError("未捕获到登录接口数据包，检查是否已重定向。")
+
+    status_code = analyze_login_response(packet.response.body)
+
+    if status_code == 0:
+        if not page.wait.ele_displayed("css:div.input-box.input-wrap", timeout=20):
+            raise RuntimeError("登录接口未返回错误，但页面未进入 AI 聊天状态")
+        print("登录成功")
+        return True
+    elif status_code == 1:
+        print("登录失败：用户名或密码错误。")
+        return False
+    elif status_code in [2, 3]:
+        print(f"登录受阻（状态码 {status_code}），准备重试...")
+        time.sleep(1)
+        raise RuntimeError("登录受阻，准备重试。")
+    else:
+        print(f"未知响应: {packet.response.body}")
+        return False
+
+
+def display_user_info(page: ChromiumPage) -> None:
+    """
+    提取并输出当前登录的用户信息（手机号掩码）。
+    """
+    user_selector = "css:div.username span.txt"
+
+    if page.wait.ele_displayed(user_selector, timeout=3):
+        username_text = page.ele(user_selector).text
+        if username_text:
+            print(f"[*] 登录成功，当前登录用户: {username_text}")
+            return
+    # 用户名仅用于日志展示，页面新版可能不再渲染这个元素；
+    # 输入框和新增回复才是任务是否成功的核心判断。
+    print("[*] 未读取到用户展示名称，继续执行对话任务。")
+
+
+def chat_and_earn_points(page: ChromiumPage) -> None:
+    """在登录成功后，跳转至聊天页面发送预置话语，并通过 DOM 提取稳定文字。"""
+    chat_url = "https://eaichat.ctyun.cn/chat/#/aichat"
+
+    if page.url != chat_url:
+        print(f"\n正在跳转至 AI 聊天页面: {chat_url}")
+        page.get(chat_url)
+
+    print("等待聊天输入框加载...")
+    input_selector = "css:div.input-box.input-wrap"
+
+    if not page.wait.ele_displayed(input_selector, timeout=10):
+        raise RuntimeError("未找到聊天输入框")
+
+    # 在确认核心页面元素加载完毕后，立刻提取并输出用户信息
+    display_user_info(page)
+
+    input_box = page.ele(input_selector)
+    message = random.choice(PRESET_MESSAGES)
+    print(f"准备发送信息: {message}")
+    input_box.input(message)
+    print("等待发送按钮变为可用...")
+    send_selector = "css:div.send-button"
+    time.sleep(5)
+
+    if page.wait.ele_displayed(send_selector, timeout=5):
+        send_button = page.ele(send_selector)
+        previous_replies = page.eles("css:div.markdown-content")
+        previous_reply_count = len(previous_replies)
+        time.sleep(1)
+        if not send_button.click():
+            raise RuntimeError("[!] 发送按钮点击失败。")
+        print("信息已发送，正在等待 AI 回复生成...\n")
+
+        latest_reply = None
+        for _ in range(30):
+            reply_elements = page.eles("css:div.markdown-content")
+            if len(reply_elements) > previous_reply_count:
+                latest_reply = reply_elements[-1]
+                break
+            time.sleep(1)
+
+        if latest_reply is None:
+            raise RuntimeError("[!] 30 秒内未出现新的 AI 回复。")
+
+        previous_text = ""
+        stable_count = 0
+        final_text = ""
+        for _ in range(90):
+            current_text = (latest_reply.text or "").strip()
+            if current_text and current_text == previous_text:
+                stable_count += 1
+            else:
+                stable_count = 0
+                previous_text = current_text
+
+            if stable_count >= 3:
+                final_text = current_text
+                break
+            time.sleep(1)
+
+        if not final_text:
+            raise RuntimeError("[!] AI 回复未生成完成。")
+
+        print("=== AI 助手回复 ===")
+        print(final_text)
+        print("\n===================\n")
+        print("[*] 积分任务完成。")
+    else:
+        raise RuntimeError("[!] 未找到发送按钮。")
+
+
+# ==========================================
+# 主流程控制
+# ==========================================
+
+
+def main() -> None:
+    login_url = (
+        "https://desk.ctyun.cn/cloudB/dy/iam/api/auth/iam/cas/login?"
+        "service=https%3A%2F%2Feaichat.ctyun.cn%3A443%2Fchat%2F%23%2Faichat&consent=false"
+    )
+    chat_url = "https://eaichat.ctyun.cn/chat/#/aichat"
+
+    my_username = os.getenv("APP_USER")
+    my_password = os.getenv("APP_PASSWORD")
+
+    if not my_username or not my_password:
+        print("错误：未检测到 APP_USER 或 APP_PASSWORD 环境变量。")
+        sys.exit(1)
+
+    task_lock = SingleInstanceLock()
+    if not task_lock.acquire():
+        print("[*] 已有其他云电脑或 AI 积分任务在运行，本次跳过。")
+        return
+    atexit.register(task_lock.release)
+
+    # 动态构造 Cookie 文件路径，包含手机号
+    # 格式：/app/data/ctyun_cookies_xxx_.json
+    if os.getenv("RUNNING_IN_DOCKER") == "true":
+        cookie_file = f"/app/data/ctyun_cookies_{my_username}_.json"
+    else:
+        cookie_file = f"./ctyun_cookies_{my_username}_.json"
+
+    browser_options = init_browser_options()
+    page = ChromiumPage(addr_or_opts=browser_options)
+    atexit.register(page.quit)
+    attempt = 0
+    max_retries = 3
+    while attempt < max_retries:
+        print(f"--- 对话尝试: {attempt + 1}/{max_retries} ---")
+        try:
+            is_logged_in = False
+
+            # === 使用动态路径进行持久化验证 ===
+            print(f"正在建立域名上下文环境，准备使用账号 {my_username} 的缓存...")
+            page.get(chat_url)
+            time.sleep(1)
+
+            if load_cookies(page, cookie_file):
+                print("正在验证 Cookie 是否有效...")
+                page.get(chat_url)
+                if page.wait.ele_displayed(
+                    "css:div.input-box.input-wrap", timeout=5
+                ):
+                    print(f"[*] 账号 {my_username} 免密登录成功！")
+                    is_logged_in = True
+                else:
+                    print("[-] Cookie 已失效，准备进行账密登录...")
+
+            # === 登录流程 (如果 Cookie 无效) ===
+            if not is_logged_in:
+                is_success = execute_login_with_listener(
+                    page, login_url, my_username, my_password
+                )
+                if is_success:
+                    # 登录成功后保存到对应手机号的文件中
+                    time.sleep(5)
+                    save_cookies(page, cookie_file)
+                    is_logged_in = True
+                else:
+                    print("[!] 自动化登录未能成功执行。")
+                    sys.exit(1)
+
+            # === 执行互动获取积分 ===
+            if is_logged_in:
+                chat_and_earn_points(page)
+                print("\n对话任务已完成")
+            return
+
+        except Exception as e:
+            attempt += 1
+            print(f"[!] 执行过程中发生异常: {e}")
+            if attempt < max_retries:
+                time.sleep(5)
+
+    print(f"[!] AI 对话积分任务连续失败 {max_retries} 次，程序终止。")
+    sys.exit(1)
+
+
+# ==========================================
+# OCR 模块封装
+# ==========================================
+
+
+class NumericOcrSolver:
+    """使用单例模式封装的数字 OCR 识别器。"""
+
+    _instance: Optional["NumericOcrSolver"] = None
+    _lock: threading.Lock = threading.Lock()
+
+    def __new__(cls) -> "NumericOcrSolver":
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._init_engine()
+        return cls._instance
+
+    def _init_engine(self) -> None:
+        self.ocr = ddddocr.DdddOcr(show_ad=False)
+        self.ocr.set_ranges(0)
+
+    def solve(self, image_data: bytes) -> str:
+        try:
+            return self.ocr.classification(image_data)
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+
+def get_bytes_numeric_captcha(image_bytes: bytes) -> str:
+    solver = NumericOcrSolver()
+    return solver.solve(image_bytes)
+
+
+if __name__ == "__main__":
+    main()
