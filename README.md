@@ -53,7 +53,7 @@
 
 ```bash
 git clone https://github.com/huanglaoji365/ctyun-auto-fix.git
-cd ctyun-auto/
+cd ctyun-auto-fix/
 bash deploy.sh
 ```
 
