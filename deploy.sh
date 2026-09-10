@@ -97,7 +97,7 @@ mkdir -p "$DATA_DIR"
 
 # 3. 构建镜像并清理同名容器
 echo -e "${YELLOW}[*] 正在构建镜像...${NC}"
-docker build --progress=plain -t ctyun-auto-sign:v1 ./app
+docker build --network=host --progress=plain -t ctyun-auto-sign:v1 ./app
 
 CONTAINER_NAME="ctyun_sign_${APP_USER}"
 if [ "$(docker ps -aq -f name=^${CONTAINER_NAME}$)" ]; then

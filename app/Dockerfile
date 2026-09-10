@@ -61,9 +61,9 @@ RUN set -eux; \
             DrissionPage==4.0.4.19 \
             ddddocr; \
     }; \
-    install_python_packages https://pypi.org/simple \
-        || install_python_packages https://mirrors.aliyun.com/pypi/simple \
-        || install_python_packages https://pypi.tuna.tsinghua.edu.cn/simple
+    install_python_packages https://mirrors.aliyun.com/pypi/simple \
+        || install_python_packages https://pypi.tuna.tsinghua.edu.cn/simple \
+        || install_python_packages https://pypi.org/simple
 
 # 6. 将 Python 脚本和启动脚本复制到工作目录
 COPY login_script.py /app/login_script.py
