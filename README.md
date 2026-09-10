@@ -22,6 +22,7 @@
 本项目中使用的保活程序来自 `CtYun` 项目：
 
 - https://github.com/leleji/CtYun
+- https://github.com/liuzhijie443/ctyun-auto
 
 当前仓库通过基础镜像 `su3817807/ctyun:latest` 使用该程序（容器内运行 `dotnet CtYun.dll`），本仓库主要补充了定时执行积分任务的能力和增加了24小时重启保活程序。
 
@@ -51,8 +52,8 @@
 在项目根目录执行：
 
 ```bash
-git clone https://github.com/liuzhijie443/ctyun-auto.git
-cd ctyun-auto/
+git clone https://github.com/huanglaoji365/ctyun-auto-fix.git
+cd ctyun-auto-fix/
 bash deploy.sh
 ```
 
