@@ -9,16 +9,25 @@ ENV TZ=Asia/Shanghai
 ENV RUNNING_IN_DOCKER=true
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# 替换为阿里云镜像源
-RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list 2>/dev/null || true && \
-    sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
+# 当前部分网络会重置 APT 的 HTTP 大文件连接，统一改用 HTTPS。
+RUN sed -i 's|http://|https://|g' /etc/apt/sources.list 2>/dev/null || true && \
+    sed -i 's|http://|https://|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
 
 # 4. 安装 Python3、包管理器、Chromium、中文字体、Cron 以及图像处理底层库。
-# 国内镜像偶尔会出现索引与软件包不同步；首次安装失败时自动切回 Debian 官方源。
+# 默认使用基础镜像自带的 Debian 官方源；失败时再切换阿里云源。
+# 较短的无响应超时可避免镜像不可达时每次卡住一分钟以上。
 RUN set -eux; \
     install_packages() { \
-        apt-get -o Acquire::Retries=5 update; \
-        DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+        apt-get \
+            -o Acquire::Retries=2 \
+            -o Acquire::http::Timeout=20 \
+            -o Acquire::https::Timeout=20 \
+            update; \
+        DEBIAN_FRONTEND=noninteractive apt-get \
+            -o Acquire::Retries=2 \
+            -o Acquire::http::Timeout=20 \
+            -o Acquire::https::Timeout=20 \
+            install -y --no-install-recommends \
             python3 \
             python3-pip \
             chromium \
@@ -30,9 +39,9 @@ RUN set -eux; \
             dos2unix; \
     }; \
     if ! install_packages; then \
-        echo "[!] 阿里云 Debian 镜像安装失败，切换到官方源重试。"; \
-        sed -i 's|mirrors.aliyun.com|deb.debian.org|g' /etc/apt/sources.list 2>/dev/null || true; \
-        sed -i 's|mirrors.aliyun.com|deb.debian.org|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
+        echo "[!] Debian 官方源安装失败，切换到阿里云源重试。"; \
+        sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null || true; \
+        sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
         rm -rf /var/lib/apt/lists/*; \
         install_packages; \
     fi; \
