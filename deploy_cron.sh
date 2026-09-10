@@ -187,7 +187,7 @@ fi
 
 # 密码
 if [ -z "$APP_PASSWORD" ]; then
-    read -r -s -p "密码（APP_PASSWORD）: " APP_PASSWORD
+    read -r -p "密码（APP_PASSWORD）: " APP_PASSWORD
     echo ""
 fi
 if [ -z "$APP_PASSWORD" ]; then
