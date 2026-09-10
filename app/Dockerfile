@@ -47,8 +47,23 @@ RUN set -eux; \
     fi; \
     rm -rf /var/lib/apt/lists/*
 
-# 5. 安装 Python 依赖（Debian 12 默认开启 PEP 668，需要 break-system-packages）
-RUN pip3 install --no-cache-dir DrissionPage==4.0.4.19 ddddocr --break-system-packages
+# 5. 安装 Python 依赖（Debian 12 默认开启 PEP 668，需要 break-system-packages）。
+# 某些网络到默认 PyPI 路由不稳定，依次尝试三个 HTTPS 源。
+RUN set -eux; \
+    install_python_packages() { \
+        pip3 install \
+            --no-cache-dir \
+            --disable-pip-version-check \
+            --timeout 30 \
+            --retries 2 \
+            --index-url "$1" \
+            --break-system-packages \
+            DrissionPage==4.0.4.19 \
+            ddddocr; \
+    }; \
+    install_python_packages https://pypi.org/simple \
+        || install_python_packages https://mirrors.aliyun.com/pypi/simple \
+        || install_python_packages https://pypi.tuna.tsinghua.edu.cn/simple
 
 # 6. 将 Python 脚本和启动脚本复制到工作目录
 COPY login_script.py /app/login_script.py
