@@ -237,7 +237,7 @@ LOGIN_SCRIPT="$DEFAULT_LOGIN_SCRIPT"
 PC_SCRIPT="$DEFAULT_PC_SCRIPT"
 
 echo -e "${YELLOW}[*] 正在构建镜像...${NC}"
-docker build -q -t ctyun-auto-sign:v1 ./app >/dev/null
+docker build --progress=plain -t ctyun-auto-sign:v1 ./app
 
 CONTAINER_NAME="ctyun_sign_${APP_USER}"
 if [ "$(docker ps -aq -f name=^${CONTAINER_NAME}$)" ]; then
