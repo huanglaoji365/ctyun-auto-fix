@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import ddddocr
 import requests
@@ -28,6 +28,8 @@ for stream in (sys.stdout, sys.stderr):
 LOGIN_URL = "https://pc.ctyun.cn/#/login"
 DESKTOP_URL = "https://pc.ctyun.cn/#/desktop-list"
 DESKTOP_DETAIL_URL_KEY = "/desktop?id="
+DESKTOP_BUTTON_SELECTOR = "css:div.desktopcom-enter"
+DESKTOP_RENDER_TIMEOUT = 60
 HANG_SECONDS = 80 * 60
 REWARD_LIST_URL = (
     "https://desk.ctyun.cn/selforder/api/selforder/prod/get"
@@ -317,6 +319,31 @@ def wait_desktop_list_refresh_done(page: ChromiumPage, timeout: int = 60) -> Non
     print("\r[*] desktop-list 刷新超时。")
 
 
+def _get_enter_buttons(page: ChromiumPage) -> List:
+    """只读取官方的云电脑进入组件，避免误点外层卡片。"""
+    try:
+        return list(page.eles(DESKTOP_BUTTON_SELECTOR) or [])
+    except Exception as e:
+        print(f"[-] 读取云电脑进入按钮失败: {e}")
+        return []
+
+
+def _get_element_text(element) -> str:
+    """兼容按钮文字被前端拆成多个子节点的情况。"""
+    candidates = []
+    try:
+        candidates.append(element.text or "")
+    except Exception:
+        pass
+    try:
+        candidates.append(
+            element.run_js("return this.innerText || this.textContent || '';") or ""
+        )
+    except Exception:
+        pass
+    return "".join("".join(candidates).split())
+
+
 def get_desktop_state(page: ChromiumPage) -> str:
     """识别 desktop-list 的状态。"""
     current_url = page.url or ""
@@ -329,11 +356,11 @@ def get_desktop_state(page: ChromiumPage) -> str:
     if empty_desc:
         return "no_desktop"
 
-    enter_buttons = page.eles("css:div.desktopcom-enter")
+    enter_buttons = _get_enter_buttons(page)
     has_cloud_pc = False
     has_cloud_phone = False
     for btn in enter_buttons:
-        text = (btn.text or "").strip()
+        text = _get_element_text(btn)
         if "进入AI云电脑" in text:
             has_cloud_pc = True
         if "进入AI云手机" in text:
@@ -343,18 +370,69 @@ def get_desktop_state(page: ChromiumPage) -> str:
         return "has_pc_button"
     if has_cloud_phone:
         return "only_phone"
+    # 新版页面偶尔在按钮已渲染时仍取不到子节点文字。官方选择器只有一个
+    # 候选时，将它作为云电脑入口处理；多个无文字按钮则不冒险误点。
+    if len(enter_buttons) == 1:
+        return "has_pc_button"
     return "unknown"
 
 
 def click_enter_ai_pc(page: ChromiumPage) -> bool:
-    """点击“进入AI云电脑”按钮。"""
-    enter_buttons = page.eles("css:div.desktopcom-enter")
+    """用原生 DOM 事件点击“进入AI云电脑”，并兼容前端文字拆分。"""
+    enter_buttons = _get_enter_buttons(page)
+    fallback_button = enter_buttons[0] if len(enter_buttons) == 1 else None
     for btn in enter_buttons:
-        text = (btn.text or "").strip()
+        text = _get_element_text(btn)
         if "进入AI云电脑" in text:
-            btn.click()
-            return True
+            fallback_button = btn
+            break
+
+    if fallback_button is None:
+        return False
+
+    try:
+        fallback_button.run_js(
+            """
+            this.dispatchEvent(new MouseEvent('click', {
+                bubbles: true,
+                cancelable: true,
+                view: window
+            }));
+            """
+        )
+        print("[*] 已向云电脑进入按钮分发 DOM 点击事件。")
+        return True
+    except Exception as dom_error:
+        print(f"[-] DOM 点击失败，尝试 JavaScript 点击: {dom_error}")
+
+    try:
+        return bool(fallback_button.click(by_js=True))
+    except Exception as js_error:
+        print(f"[-] JavaScript 点击失败，尝试普通点击: {js_error}")
+
+    try:
+        fallback_button.click()
+        return True
+    except Exception as click_error:
+        print(f"[-] 普通点击也失败: {click_error}")
     return False
+
+
+def wait_for_desktop_state(
+    page: ChromiumPage, timeout: int = DESKTOP_RENDER_TIMEOUT
+) -> Tuple[str, List[str]]:
+    """等待前端完成渲染，同时返回最后看到的按钮文字用于诊断。"""
+    end_time = time.time() + timeout
+    last_state = "unknown"
+    last_button_texts: List[str] = []
+    while time.time() < end_time:
+        last_state = get_desktop_state(page)
+        buttons = _get_enter_buttons(page)
+        last_button_texts = [_get_element_text(button) for button in buttons]
+        if last_state != "unknown":
+            return last_state, last_button_texts
+        time.sleep(1)
+    return last_state, last_button_texts
 
 
 def wait_desktop_opened(page: ChromiumPage, timeout: int = 270) -> bool:
@@ -1187,7 +1265,6 @@ def main(config_redeem_only: bool = False) -> None:
 
         relogin_attempts = 0
         max_relogin_attempts = 3
-        unknown_attempts = 0
         desktop_open_attempts = 0
         max_desktop_open_attempts = 3
         desktop_opened = False
@@ -1196,8 +1273,13 @@ def main(config_redeem_only: bool = False) -> None:
             page.get(DESKTOP_URL)
             time.sleep(1)
             wait_desktop_list_refresh_done(page, timeout=60)
-            state = get_desktop_state(page)
-            print(f"\r[*] desktop-list 状态: {state}")
+            state, button_texts = wait_for_desktop_state(
+                page, timeout=DESKTOP_RENDER_TIMEOUT
+            )
+            print(
+                f"\r[*] desktop-list 状态: {state}; "
+                f"当前网址: {page.url}; 进入按钮: {button_texts or '未发现'}"
+            )
 
             if state == "auth_expired":
                 if relogin_attempts >= max_relogin_attempts:
@@ -1248,12 +1330,9 @@ def main(config_redeem_only: bool = False) -> None:
                 desktop_opened = True
                 break
 
-            unknown_attempts += 1
-            if unknown_attempts >= 3:
-                print("[!] 无法识别 desktop-list 页面状态，任务结束。")
-                sys.exit(1)
-            print(f"[-] 未识别到明确状态，重试中 ({unknown_attempts}/3)")
-            time.sleep(2)
+            print("[!] 等待 60 秒后仍无法识别 desktop-list 页面状态。")
+            save_screenshot(page)
+            sys.exit(1)
 
         if not desktop_opened:
             print("[!] 未进入云电脑页面。")
@@ -1275,18 +1354,25 @@ def main(config_redeem_only: bool = False) -> None:
         page.quit()
 
     except Exception as e:
-        # save_screenshot(page)
+        save_screenshot(page)
         print(f"[!] 执行异常: {e}")
         sys.exit(1)
 
 
 def save_screenshot(page: ChromiumPage) -> None:
-    file_name = f"{os.getenv('APP_USER')}_{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    file_name = (
+        f"pc_login_{os.getenv('APP_USER')}_"
+        f"{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
+    )
     if os.getenv("RUNNING_IN_DOCKER") == "true":
         path = "/app/data"
     else:
         path = "./"
-    page.get_screenshot(path=path, name=file_name, full_page=True)
+    try:
+        page.get_screenshot(path=path, name=file_name, full_page=True)
+        print(f"[*] 已保存故障截图: {Path(path) / file_name}")
+    except Exception as e:
+        print(f"[-] 保存故障截图失败: {e}")
 
 
 if __name__ == "__main__":

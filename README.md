@@ -83,6 +83,13 @@ docker start ctyun_sign_<APP_USER>
 
 # 自动兑换奖励配置
 docker exec -it ctyun_sign_<APP_USER> python3 /app/pc_login.py --config-redeem
+
+# 查看实际安装的定时任务
+docker exec -it ctyun_sign_<APP_USER> cat /etc/cron.d/ctyun-cron
+
+# 分别查看 AI 对话和云电脑使用时长任务的最近日志
+docker exec -it ctyun_sign_<APP_USER> tail -n 100 /app/data/cron_login_script.log
+docker exec -it ctyun_sign_<APP_USER> tail -n 100 /app/data/cron_pc_login.log
 ```
 
 验证码识别api方案来自 https://github.com/sml2h3/ddddocr
